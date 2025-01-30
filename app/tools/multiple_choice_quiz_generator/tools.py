@@ -4,13 +4,14 @@ import os
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
 from langchain_core.output_parsers import JsonOutputParser, BaseOutputParser
 from pydantic import BaseModel, Field
 from langchain_google_genai import GoogleGenerativeAI
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain.retrievers.multi_query import MultiQueryRetriever
 from langsmith import traceable
+from app.tools.multiple_choice_quiz_generator.QuizEvaluator import QuizEvaluator
 
 from app.services.logger import setup_logger
 
@@ -106,7 +107,7 @@ class QuizBuilder:
             retriever_k = number_documents
             retriever = self.retriever_factory.create_multiquery_retriever(
                     vectorstore, num_questions, retriever_k)
-
+            
             self.runner = RunnableParallel(
                 {
                 "context": retriever, 
@@ -121,13 +122,23 @@ class QuizBuilder:
                                "num_questions": num_questions
                                }
         )
+
+        # Initialize evaluator
+        evaluator = QuizEvaluator()
+        evaluate_runnable = RunnableParallel(
+            {
+                "source_documents": lambda _: documents,
+                "quiz_questions": RunnablePassthrough()
+            }
+        ) | RunnableLambda(evaluator.invoke) | RunnableLambda( lambda input: input["quiz_questions"] )
+
         trace_metadata = {
             "number_documents": number_documents,
             "n_questions": num_questions,
             "topic": self.topic,
             "lang": self.lang
         }
-        chain = (self.runner | prompt | self._model | self._parser).with_config(trace_metadata)
+        chain = (self.runner | prompt | self._model | self._parser | evaluate_runnable).with_config(trace_metadata)
         
         if self.verbose: logger.info(f"Chain compilation complete")
         
@@ -201,7 +212,6 @@ class QuizBuilder:
         # Log if fewer questions are generated
         if number_generated_questions < num_questions:
             if self.verbose: logger.warning(f"Only generated {number_generated_questions} out of {num_questions} requested questions")
-        
 
         self.vectorstore_manager.cleanup()
         
@@ -322,6 +332,7 @@ class QuestionChoice(BaseModel):
     value: str = Field(description="The text content of the choice")
 
 class QuizQuestion(BaseModel):
+    question_id: str = Field(description="The question unique ID")
     question: str = Field(description="The question text")
     choices: List[QuestionChoice] = Field(description="A list of choices for the question, each with a key and a value")
     answer: str = Field(description="The key of the correct answer from the choices list")
@@ -335,6 +346,7 @@ class QuizQuestionsList(BaseModel):
             "examples": """ 
                 "questions_list": [
                     {
+                        "question_id": "1",
                         "question": "What is the capital of France?",
                         "choices": [
                             {"key": "A", "value": "Berlin"},
@@ -346,6 +358,7 @@ class QuizQuestionsList(BaseModel):
                         "explanation": "Paris is the capital of France."
                     },
                     {
+                        "question_id": "2",
                         "question": "What is the official language of France?",
                         "choices": [
                             {"key": "A", "value": "French"},
@@ -357,10 +370,8 @@ class QuizQuestionsList(BaseModel):
                         "explanation": "The official language of France is French."
                     },
                 ]§
-
-          """
+            """
         }
-
       }
     
 
