@@ -1,5 +1,6 @@
 from typing import List, Dict
 import os
+import uuid
 
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
@@ -10,7 +11,7 @@ from pydantic import BaseModel, Field
 from langchain_google_genai import GoogleGenerativeAI
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain.retrievers.multi_query import MultiQueryRetriever
-from langsmith import traceable
+from langsmith import traceable, Client
 from app.tools.multiple_choice_quiz_generator.QuizEvaluator import QuizEvaluator
 
 from app.services.logger import setup_logger
@@ -52,6 +53,7 @@ class QuizBuilderConfig:
         self,
         model = None,
         embedding_model = None,
+        query_model = None,
         vectorstore_class = None,
         max_questions: int = 10,
         min_questions: int = 1,
@@ -59,10 +61,12 @@ class QuizBuilderConfig:
         prompt_template_path: str = "prompt/multiple_choice_quiz_generator_prompt.txt",
         multi_query_prompt_path: str = "prompt/multi_query_prompt.txt",
         parser: JsonOutputParser = None,
-        verbose: bool = False
+        verbose: bool = False,
+        score_threshold: float = 0.4
     ):
         self.model = model or GoogleGenerativeAI(model="gemini-1.5-pro", max_output_tokens=None ) 
         self.embedding_model = embedding_model or GoogleGenerativeAIEmbeddings(model='models/embedding-001')
+        self.query_model = query_model or GoogleGenerativeAI(model="gemini-1.5-pro")
         self.vectorstore_class = vectorstore_class or Chroma
         self.max_questions = max_questions
         self.min_questions = min_questions
@@ -70,6 +74,7 @@ class QuizBuilderConfig:
         self.prompt_template_path = prompt_template_path
         self.multi_query_prompt_path = multi_query_prompt_path
         self.verbose = verbose
+        self.score_threshold = score_threshold
 
         # load the prompt template
         self.prompt_template = read_text_file(self.prompt_template_path)
@@ -100,6 +105,7 @@ class QuizBuilder:
         self._prompt_template = self.config.prompt_template
         self._parser = self.config.parser
 
+        self.run_id = uuid.uuid4()
 
         # Initialize components
         self.vectorstore_manager = VectorStoreManager(self.config)
@@ -135,27 +141,44 @@ class QuizBuilder:
             retriever = self.retriever_factory.create_multiquery_retriever(
                     vectorstore, num_questions, retriever_k)
             
+            def log_retriever(inputs):
+                result = retriever.invoke(inputs)
+                retrieval_percentage = round((len(result) / number_documents) * 100, 0)
+                Client().create_feedback(
+                    run_id=self.run_id,
+                    key="retrieval_percentage",
+                    value=retrieval_percentage,
+                    comment=f"""Percentage of documents retrieved out of {number_documents} relevant documents.
+                              Total documents retrieved: {len(result)}"""
+                )
+                return result
+            
+            retriever_step = RunnableLambda(log_retriever)
             self.runner = RunnableParallel(
                 {
-                "context": retriever, # Retrieves relevant context from documents
-                "attribute_collection": RunnablePassthrough(),  # Passes through the topic and language
-                "num_questions": lambda _: str(num_questions)  # Converts num_questions to string for template
+                "context": retriever_step.with_config({"run_name": "ContextRetrievalChain"}), # Retrieves relevant context from documents
+                "attribute_collection": RunnablePassthrough().with_config({"run_name": "attribute_collection"}),  # Passes through the topic and language
+                "num_questions": lambda _: str(num_questions) # Converts num_questions to string for template
                 }
-            )
+            ).with_config({"run_name": "PromptVariableChain"})
+
         # Initialize evaluator
-        evaluator = QuizEvaluator()
+        evaluator = QuizEvaluator(verbose=self.verbose)
         evaluate_runnable = RunnableParallel(
             {
                 "source_documents": lambda _: documents,
-                "quiz_questions": RunnablePassthrough()
+                "quiz_questions": RunnablePassthrough(),
+                "run_id": lambda _: self.run_id
             }
-        ) | RunnableLambda(evaluator.invoke) | RunnableLambda( lambda input: input["quiz_questions"] )
+        ).with_config({"run_name": "EvaluatorInputProcessing"}) | RunnableLambda(evaluator.invoke).with_config({"run_name": "Evaluator"}) | RunnableLambda( 
+            lambda input: input["quiz_questions"] )
 
         trace_metadata = {
             "number_documents": number_documents,
             "n_questions": num_questions,
             "topic": self.topic,
-            "lang": self.lang
+            "lang": self.lang,
+            "threshold": self.config.score_threshold
         }
         chain = (self.runner | prompt | self._model | self._parser | evaluate_runnable).with_config(trace_metadata)
         
@@ -191,7 +214,7 @@ class QuizBuilder:
 
             try:
                 # Run the pipeline with the provided input data
-                response = chain.invoke(f"Topic: {self.topic}, Lang: {self.lang}")
+                response = chain.invoke({"input": f"Topic: {self.topic}, Lang: {self.lang}"}, {"run_id": self.run_id})
         
                 logger.info(f"Generated response: {response}")
                 if response is None: next
@@ -222,7 +245,8 @@ class QuizBuilder:
         if number_generated_questions < num_questions:
             if self.verbose: logger.warning(f"Only generated {number_generated_questions} out of {num_questions} requested questions")
 
-        self.vectorstore_manager.cleanup()
+        # Cleanup resources
+        self.cleanup()
         
         # Return requested number of questions (or fewer if not enough were generated)
         return generated_questions[:num_questions]
@@ -285,7 +309,9 @@ class QuizBuilder:
         ordered_keys = ['A', 'B', 'C', 'D']
         return {key: choices[key] for key in ordered_keys if key in choices}
 
-
+    def cleanup(self):
+        self.retriever_factory.cleanup()
+        self.vectorstore_manager.cleanup()
 class RetrieverFactory:
     
     def __init__(self, config: QuizBuilderConfig):
@@ -293,6 +319,8 @@ class RetrieverFactory:
 
         self._model = config.model
         self._prompt_template = config.multi_query_prompt_template
+        self._multiquery_retriever = None
+        self.score_threshold = config.score_threshold
     
     def create_multiquery_prompt(self, num_questions: int) -> PromptTemplate:
         try:
@@ -307,11 +335,13 @@ class RetrieverFactory:
             logger.error(f"Failed to create multiquery prompt: {e}") if self.verbose else None
             raise Exception(f"Prompt creation failed: {str(e)}")
 
-    def create_base_retriever(self, vectorstore, retriever_k: int):
+    def create_base_retriever(self, vectorstore, retriever_k: int, score_threshold: float):
         try:
             return vectorstore.as_retriever(
+                search_type="similarity_score_threshold",
                 search_kwargs={
                     "k": retriever_k,
+                    "score_threshold": score_threshold
                 }
             )
         except Exception as e:
@@ -331,17 +361,19 @@ class RetrieverFactory:
         self, 
         vectorstore,
         num_questions: int,
-        retriever_k: int
+        retriever_k: int,
+        score_threshold: float = None
     ) -> MultiQueryRetriever:
         if self.verbose:
             logger.info("Setting up MultiQueryRetriever")
             
         try:
-            base_retriever = self.create_base_retriever(vectorstore, retriever_k)
+            search_score_threshold = score_threshold or self.score_threshold
+            base_retriever = self.create_base_retriever(vectorstore, retriever_k, search_score_threshold)
             prompt = self.create_multiquery_prompt(num_questions)
             chain = self.create_multiquery_chain(prompt)
             
-            retriever = MultiQueryRetriever(
+            self.multiquery_retriever = MultiQueryRetriever(
                 retriever=base_retriever,
                 llm_chain=chain,
                 parser_key="lines",
@@ -351,11 +383,20 @@ class RetrieverFactory:
             if self.verbose:
                 logger.info("MultiQueryRetriever created successfully")
                 
-            return retriever
+            return self.multiquery_retriever
             
         except Exception as e:
             logger.error(f"Failed to create enhanced retriever: {e}")
             raise Exception(f"Multiquery retriever creation failed: {str(e)}")
+        
+    def cleanup(self):  
+        if self.verbose: logger.info(f"Deleting multiquery retriever")
+        if self._multiquery_retriever:
+            self._multiquery_retriever.delete_collection()
+            self._multiquery_retriever = None
+            self._model = None
+            self._prompt_template = None
+    
 class VectorStoreManager:
     
     def __init__(self, config: 'QuizBuilderConfig'):

@@ -3,6 +3,7 @@ from typing import List, Dict
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import JsonOutputParser
 from langchain.prompts import PromptTemplate
+from langsmith import Client
 
 from app.services.logger import setup_logger
 
@@ -88,7 +89,6 @@ class QuizEvaluator:
             "source_documents": documents_text,
             "quiz_questions": questions_text
         })
-        
             
         # Calculate overall score
         scores = [
@@ -96,18 +96,51 @@ class QuizEvaluator:
             evaluation["uniqueness"]["score"],
             evaluation["coverage"]["score"]
         ]
-        evaluation["overall_score"] = sum(scores) / len(scores)
+        evaluation["overall_score"] = round(sum(scores) / len(scores), 0)
         
         return evaluation
             
+    def log_evaluation(self, evaluation: Dict, run_id):
+        """
+        Log evaluation results.
+        
+        Args:
+            evaluation (Dict): Evaluation results
+        """
+        smith_client = Client()
+        smith_client.create_feedback(
+            run_id=run_id, key="content_alignment", 
+            value=evaluation['content_alignment']["score"],
+            comment=evaluation['content_alignment']["reasoning"])
+        smith_client.create_feedback(
+            run_id=run_id, 
+            key="uniqueness", 
+            value=evaluation['uniqueness']["score"],
+            comment=evaluation['uniqueness']["reasoning"])
+        smith_client.create_feedback(
+            run_id=run_id, 
+            key="coverage", 
+            value=evaluation['coverage']["score"],
+            comment=evaluation['coverage']["reasoning"])
+        smith_client.create_feedback(
+            run_id=run_id, 
+            key="overall_score", 
+            value=evaluation['overall_score'],
+            comment=evaluation['overall_feedback'])
+        
+
     def invoke(self, inputs: Dict) -> Dict:
         try:
-            logger.info("Evaluating quiz questions...")
+            logger.info("Evaluating quiz questions...") if self.verbose else None
             # Run evaluation
-            evaluation = self.evaluate_quiz(inputs["source_documents"], inputs["quiz_questions"])
-
+            evaluation = self.evaluate_quiz(inputs["source_documents"], inputs["quiz_questions"]["questions_list"])
+            self.log_evaluation(evaluation, inputs["run_id"])
             if self.verbose:
-                logger.info(f"Evaluation results: {evaluation}")
+                logger.info("Quiz Evaluation Results:")
+                logger.info(f"Content Alignment: {evaluation['content_alignment']}")
+                logger.info(f"Uniqueness: {evaluation['uniqueness']}")
+                logger.info(f"Coverage: {evaluation['coverage']}")
+                logger.info(f"Overall Feedback: {evaluation['overall_feedback']}")
 
             # Return quiz questions to maintain consistency with other tools
             return {"quiz_questions": inputs["quiz_questions"], "evaluation": evaluation}  
